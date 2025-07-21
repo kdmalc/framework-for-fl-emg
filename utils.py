@@ -1,8 +1,175 @@
+import os
+import h5py
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import h5py
 
+
+def reorder_list(main_list, data_list, str_2_move="Static"):
+    # Find the index of str_2_move in the main list
+    static_index = main_list.index(str_2_move)
+
+    # Reorder main list to put str_2_move first
+    reordered_main_list = [str_2_move] + main_list[:static_index] + main_list[static_index + 1:]
+
+    # Reorder data list to match the new order of main_list
+    reordered_data_list = [data_list[static_index]] + data_list[:static_index] + data_list[static_index + 1:]
+
+    return reordered_main_list, reordered_data_list
+
+
+def RUSA_load_data(full_file_path, update_num=-2, verbose=False, static=False):
+    filt_emg_idx=2
+    dec_idx=3
+    p_act_idx=8
+    p_ref_idx=7
+    
+    if update_num==-2:
+        init_idx = -1600
+        final_idx = -800
+    elif update_num==-1:
+        init_idx = -800
+        final_idx = -1
+    elif update_num==0:
+        init_idx = 0
+        final_idx = 800
+    else:
+        raise ValueError(f"update_num {update_num} not supported, please use 0, -1, or -2!")
+        
+    if not static:
+        try:
+            with h5py.File(full_file_path, 'r') as handle:
+                weiner_dataset = handle['weiner']
+                weiner_df = pd.DataFrame(weiner_dataset)
+
+            # Get the last 1600 points and then only keep points from -1600 to -800
+            weiner_df = weiner_df.iloc[-1600:final_idx]
+
+            # Create lists for the remaining data
+            dec_lst = [weiner_df.iloc[i, 0][dec_idx] for i in range(weiner_df.shape[0])]
+            emg_lst = [weiner_df.iloc[i, 0][filt_emg_idx] for i in range(weiner_df.shape[0])]
+            pref_lst = [weiner_df.iloc[i, 0][p_ref_idx] for i in range(weiner_df.shape[0])]
+            pact_lst = [weiner_df.iloc[i, 0][p_act_idx] for i in range(weiner_df.shape[0])]
+            return dec_lst, emg_lst, pref_lst, pact_lst
+        except OSError:
+            print(f"Unable to open/find file: {full_file_path}\nThus, downstream will be dummy values of -1")
+            return [], [], [], []
+    
+    
+def return_final_averaged_cost_and_tdposerror(full_file_path, update_num=-2):
+    dec_lst, emg_lst, pref_lst, pact_lst = RUSA_load_data(full_file_path, update_num=update_num, verbose=False, static=False)
+    if len(dec_lst)==0:
+        return -1, -1
+    else:
+        cost_log, perf_log, penalty_log = calc_cost_function(emg_lst, dec_lst, pref_lst, pact_lst)
+        td_error = calc_time_domain_error(np.array(pref_lst), np.array(pact_lst))
+        return np.mean(cost_log), np.mean(td_error)
+    
+
+# Function to extract cost and time-domain performance
+def extract_performance(file_dict):
+    results = {}
+    for key, file_path in file_dict.items():
+        mean_cost, mean_tdpe = return_final_averaged_cost_and_tdposerror(file_path)
+        results[key] = {
+            'mean_cost': mean_cost,
+            'mean_tdpe': mean_tdpe
+        }
+    return results
+
+
+def avg_client_results_across_folds(extraction_dict, algorithm, num_clients=14, num_folds=7, verbose=False):
+    #print(f"ALGO: {algorithm}")
+    client_logs = {f'S{i}_client_local_cost_func_comps_log': 0.0 for i in range(num_clients)}  # S0 to S13
+    global_logs = {f'S{i}_client_global_cost_func_comps_log': 0.0 for i in range(num_clients)}  # S0 to S13
+    for fold in range(num_folds):
+        for i in range(num_clients):
+            # Access client local test logs for each fold
+            client_key = f'S{i}_client_local_cost_func_comps_log_fold{fold}'
+            try:
+                client_last_n_logs = np.array(extraction_dict[client_key][-10:]) 
+                client_data = np.mean([ele[1] for ele in client_last_n_logs])
+                #print(f"client data shape: {client_data.shape}")
+                if client_logs[f'S{i}_client_local_cost_func_comps_log'] == 0.0:
+                    #print("Instantiating empty entry")
+                    client_logs[f'S{i}_client_local_cost_func_comps_log'] = client_data
+                else:
+                    #print("Adding new data")
+                    client_logs[f'S{i}_client_local_cost_func_comps_log'] += client_data
+                #print(f"Local cli{i} SUCCESS!")
+            except KeyError:
+                # It was a testing client and thus not saved, so just skip to the next iter
+                #print(f"Local cli{i} FAILED!")
+                pass
+    
+            if "NOFL" in algorithm:
+                pass
+            else: 
+                # Access global and local test logs for each fold
+                global_key = f'S{i}_client_global_cost_func_comps_log_fold{fold}'
+                try:
+                    client_last_n_global_logs = np.array(extraction_dict[global_key][-10:]) 
+                    # Mean across last n values, for one client, within one fold
+                    client_global_data = np.mean([ele[1] for ele in client_last_n_global_logs])
+                    if global_logs[f'S{i}_client_global_cost_func_comps_log'] == 0.0:
+                        global_logs[f'S{i}_client_global_cost_func_comps_log'] = client_global_data
+                    else:
+                        global_logs[f'S{i}_client_global_cost_func_comps_log'] += client_global_data
+                    #print(f"Global cli{i} SUCCESS!")
+                except KeyError:
+                    # It was a testing client and thus not saved, so just skip to the next iter
+                    #print(f"Global cli{i} FAILED!")
+                    pass
+            #print()
+    #print()
+    
+    # Return the results
+    return client_logs, global_logs
+
+
+def load_model_logs(cv_results_path, filename, num_clients=14, num_folds=7, verbose=False):
+    extraction_dict = dict()
+    for i in range(num_folds):
+        h5_path = os.path.join(cv_results_path, filename+f"{i}.h5")
+        #print(h5_path)
+        
+        # Load data from HDF5 file
+        with h5py.File(h5_path, 'r') as f:
+            a_group_key = list(f.keys())
+            #if i==0:
+            #    print(a_group_key)
+            for key in a_group_key:
+                #print(key)
+        
+                if key=="client_local_model_log":
+                    client_keys = list(f[key])
+                    #print(client_keys)
+                    for ck in client_keys:
+                        ed_key = f"{ck}_fold{i}"  # Does this never update from or something...
+                        #print(f"Key: {key}, Client: {ck}, Fold: {i}")
+    
+                        # So this doenst have any knoledge of the fold number???
+                        if len(list(f[key][ck]))==0:
+                            #print(f"{ed_key} SKIPPED!")
+                            pass
+                        else:
+                            #print(f"{ed_key} SUCCESS!")
+                            extraction_dict[ed_key] = list(f[key][ck])
+                elif key=="global_dec_log" and "NOFL" not in filename:
+                    # Do I need to turn this off for NoFL? Or will it just be empty and append something empty...
+                    ed_key = f"{key}_fold{i}"
+                    #print(ed_key)
+                    extraction_dict[ed_key] = list(f[key])
+                else:
+                    pass
+
+    return extraction_dict
+
+############################################################
+# From analysis_funcs... these funcs are probably elsewhere in this repo...
+############################################################
+
+
+import matplotlib.pyplot as plt
 # Only used for boxplots
 import matplotlib.patches as mpatches
 
@@ -675,4 +842,3 @@ def plot_multiple_final_initial_position_error_boxplots(update_ix_lst, pref_lst,
         plt.xticks(range(len(update_ix_lst)*2), trial_names_lst, rotation=90, fontsize=ticks_fontsize)
     plt.yticks(fontsize=ticks_fontsize)
     plt.show()
-    
